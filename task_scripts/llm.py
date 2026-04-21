@@ -14,7 +14,8 @@ from vllm import SamplingParams
 class GenerateConfig:
     max_new_tokens: int = 1024
     temperature: float = 0.6
-    seed: int = 42
+    top_p: float = 0.95
+    top_k: int = 20
 
 
 class LLM(ABC):
@@ -57,7 +58,6 @@ class TransformersLLM(LLM):
         batch_messages: List[List[Dict[str, str]]],
         config: GenerateConfig,
     ) -> List[str]:
-        torch.manual_seed(config.seed)
         input_texts = []
         for messages in batch_messages:
             input_text = self._tokenizer.apply_chat_template(
@@ -74,10 +74,13 @@ class TransformersLLM(LLM):
             padding=True,
         ).to(self._model.device)
         prompt_len = int(model_inputs["input_ids"].shape[1])
-        out = self._model.generate(
+        out = self._model.generate(  # type: ignore
             **model_inputs,
             max_new_tokens=config.max_new_tokens,
             temperature=config.temperature,
+            do_sample=config.temperature > 0,
+            top_p=config.top_p,
+            top_k=config.top_k,
         )
 
         output_texts = []
@@ -106,7 +109,8 @@ class OpenAILLM(LLM):
             messages=cast(Any, messages),
             max_tokens=config.max_new_tokens,
             temperature=config.temperature,
-            seed=config.seed,
+            top_p=config.top_p,
+            extra_body={"top_k": config.top_k},
         )
         return resp.choices[0].message.content or ""
 
@@ -148,7 +152,8 @@ class VllmLLM(LLM):
         sampling_params = SamplingParams(
             temperature=config.temperature,
             max_tokens=config.max_new_tokens,
-            seed=config.seed,
+            top_p=config.top_p,
+            top_k=config.top_k,
         )
         outputs = self._llm.chat(
             cast(Any, batch_messages),

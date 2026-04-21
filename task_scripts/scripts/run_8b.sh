@@ -1,4 +1,4 @@
-MODEL_PATH="/mlx/users/fanliwen.2333/playground/models/Qwen3-8B"
+MODEL_PATH="/root/autodl-tmp/models/Qwen3-8B"
 MODEL_NAME="Qwen3-8B"
 
 python -m vllm.entrypoints.openai.api_server \
@@ -7,5 +7,6 @@ python -m vllm.entrypoints.openai.api_server \
   --enable-auto-tool-choice \
   --tool-call-parser hermes \
   --host 0.0.0.0 \
-  --port 8000 \
+  --port 8080 \
+  --max-model-len 8192 \
   --gpu-memory-utilization 0.85
