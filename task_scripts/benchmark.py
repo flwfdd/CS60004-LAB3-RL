@@ -52,8 +52,8 @@ def main() -> None:
     backend = "openai"
 
     # 0p6b / 8b
-    # model_size = "0p6b"
-    model_size = "8b"
+    model_size = "0p6b"
+    # model_size = "8b"
 
     # 从 .env 读取模型配置
     model_path = os.getenv(f"MODEL_PATH_{model_size.upper()}", "")
@@ -62,14 +62,15 @@ def main() -> None:
     api_key = os.getenv("API_KEY", "EMPTY")
 
     # 数据路径
-    val_data_path = os.getenv("TRAIN_DATA_PATH", "")
-    output_path = Path("data/benchmark/8b_4096/")
+    val_data_path = os.getenv("VAL_DATA_PATH", "")
+    output_path = ""
+    # output_path = Path("data/benchmark/8b_4096_long/")
 
     # VLLM 配置
     vllm_gpu_memory_utilization = 0.85
 
     # 评测规模与生成配置
-    max_samples = 10000
+    max_samples = 1000
     print_samples = 1
     batch_size = 256
     max_new_tokens = 4096
