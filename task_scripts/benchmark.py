@@ -1,78 +1,116 @@
-from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
 
-from eval_common import run_benchmark
-from llm import LLM, GenerateConfig, OpenAILLM, TransformersLLM, VllmLLM
+from common import LLM, BenchmarkResult, GenerateConfig, run_benchmark
+from dotenv import load_dotenv
+from llm import OpenAILLM, TransformersLLM, VllmLLM
+
+load_dotenv()
 
 
-@dataclass(frozen=True)
-class Config:
-    # 后端类型：local / openai / vllm
-    backend: str = "openai"
+def save_benchmark_result(result: BenchmarkResult, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 模型与数据路径
-    model_path: str = "/root/autodl-tmp/models/Qwen3-0.6B"
-    # model_name: str = "Qwen3-0.6B"
-    model_name: str = "Qwen3-8B"
-    data_path: str = "/root/autodl-tmp/code/CS60004-LAB3-RL/data/splits/val.jsonl"
+    with output_path.open("w", encoding="utf-8") as f:
+        for item in result.details:
+            record = {
+                "nums": item.sample.nums,
+                "target": item.sample.target,
+                "ok": item.ok,
+                "ans": item.ans,
+                "format_ok": item.format_ok,
+                "output_len": item.output_len,
+                "messages": item.messages,
+            }
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    # OpenAI 接口配置
-    # base_url: str = "http://127.0.0.1:8006/v1"
-    base_url: str = "http://127.0.0.1:8080/v1"
-    api_key: str = "EMPTY"
+    acc = result.correct / result.total if result.total else 0.0
+    format_rate = result.format_correct / result.total if result.total else 0.0
+    summary_path = output_path.with_suffix(".summary.json")
+    summary = {
+        "total": result.total,
+        "correct": result.correct,
+        "accuracy": acc,
+        "format_correct": result.format_correct,
+        "format_accuracy": format_rate,
+        "avg_output_len": result.avg_output_len,
+        "avg_output_len_correct": result.avg_output_len_correct,
+        "avg_output_len_format_ok_wrong": result.avg_output_len_format_ok_wrong,
+        "avg_output_len_format_wrong": result.avg_output_len_format_wrong,
+    }
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"Saved benchmark details to {output_path}")
+    print(f"Saved benchmark summary to {summary_path}")
+
+
+def main() -> None:
+    # local / openai / vllm
+    backend = "openai"
+
+    # 0p6b / 8b
+    # model_size = "0p6b"
+    model_size = "8b"
+
+    # 从 .env 读取模型配置
+    model_path = os.getenv(f"MODEL_PATH_{model_size.upper()}", "")
+    model_name = os.getenv(f"MODEL_NAME_{model_size.upper()}", "")
+    base_url = os.getenv(f"BASE_URL_{model_size.upper()}", "")
+    api_key = os.getenv("API_KEY", "EMPTY")
+
+    # 数据路径
+    val_data_path = os.getenv("TRAIN_DATA_PATH", "")
+    output_path = Path("data/benchmark/8b_4096/")
 
     # VLLM 配置
-    vllm_gpu_memory_utilization: float = 0.85
+    vllm_gpu_memory_utilization = 0.85
 
     # 评测规模与生成配置
-    max_samples: int = 100
-    print_samples: int = 1
-    batch_size: int = 128
-    max_new_tokens: int = 1024
-    temperature: float = 0.6
-    top_p: float = 0.95
-    top_k: int = 20
+    max_samples = 10000
+    print_samples = 1
+    batch_size = 256
+    max_new_tokens = 4096
+    temperature = 0.6
+    top_p = 0.95
+    top_k = 20
 
-
-CFG = Config()
-
-
-def build_llm(cfg: Config) -> LLM:
-    if cfg.backend == "local":
-        return TransformersLLM(
-            cfg.model_path,
+    llm: LLM
+    if backend == "local":
+        llm = TransformersLLM(model_path)
+    elif backend == "openai":
+        llm = OpenAILLM(
+            base_url=base_url,
+            api_key=api_key,
+            model_name=model_name,
         )
-    if cfg.backend == "openai":
-        return OpenAILLM(
-            base_url=cfg.base_url,
-            api_key=cfg.api_key,
-            model_name=cfg.model_name,
+    elif backend == "vllm":
+        llm = VllmLLM(
+            model_path,
+            gpu_memory_utilization=vllm_gpu_memory_utilization,
         )
-    if cfg.backend == "vllm":
-        return VllmLLM(
-            cfg.model_path,
-            gpu_memory_utilization=cfg.vllm_gpu_memory_utilization,
-        )
-    raise ValueError(f"No backend: {cfg.backend}")
+    else:
+        raise ValueError(f"No backend: {backend}")
 
-
-def main(cfg: Config = CFG) -> None:
-    llm = build_llm(cfg)
     generate_config = GenerateConfig(
-        max_new_tokens=cfg.max_new_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        top_k=cfg.top_k,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
     )
+
     try:
         benchmark_result = run_benchmark(
             llm,
-            cfg.data_path,
-            max_samples=cfg.max_samples,
-            batch_size=cfg.batch_size,
+            val_data_path,
+            max_samples=max_samples,
+            batch_size=batch_size,
             generate_config=generate_config,
         )
 
-        for result in benchmark_result.details[: cfg.print_samples]:
+        for result in benchmark_result.details[:print_samples]:
             print(f"nums={result.sample.nums}, target={result.sample.target}")
             print(f"assistant={result.messages[-1]['content']}")
             print(f"answer={result.ans}")
@@ -84,9 +122,24 @@ def main(cfg: Config = CFG) -> None:
             if benchmark_result.total
             else 0.0
         )
+        format_rate = (
+            benchmark_result.format_correct / benchmark_result.total
+            if benchmark_result.total
+            else 0.0
+        )
         print(f"Evaluated: {benchmark_result.total}")
-        print(f"Correct:   {benchmark_result.correct}")
-        print(f"Accuracy:  {acc:.4f}")
+        print(f"Correct: {benchmark_result.correct} ({acc:.4f})")
+        print(f"Format Correct: {benchmark_result.format_correct} ({format_rate:.4f})")
+        print(
+            "Avg output len (tokens): "
+            f"all={benchmark_result.avg_output_len:.1f}, "
+            f"correct={benchmark_result.avg_output_len_correct:.1f}, "
+            f"format_ok_wrong={benchmark_result.avg_output_len_format_ok_wrong:.1f}, "
+            f"format_wrong={benchmark_result.avg_output_len_format_wrong:.1f}"
+        )
+        if output_path:
+            save_benchmark_result(benchmark_result, output_path)
+
     finally:
         llm.close()
 

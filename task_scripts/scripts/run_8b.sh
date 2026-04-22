@@ -1,4 +1,4 @@
-MODEL_PATH="/root/autodl-tmp/models/Qwen3-8B"
+MODEL_PATH="/mlx/users/fanliwen.2333/playground/models/Qwen3-8B"
 MODEL_NAME="Qwen3-8B"
 
 python -m vllm.entrypoints.openai.api_server \

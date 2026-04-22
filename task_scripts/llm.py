@@ -1,48 +1,34 @@
-from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List
 
 import torch
+from common import LLM, GenerateConfig, Generation, build_model_inputs
 from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM as VLLMEngine
 from vllm import SamplingParams
 
 
-@dataclass
-class GenerateConfig:
-    max_new_tokens: int = 1024
-    temperature: float = 0.6
-    top_p: float = 0.95
-    top_k: int = 20
-
-
-class LLM(ABC):
-    @abstractmethod
-    def generate_batch(
-        self,
-        batch_messages: List[List[Dict[str, str]]],
-        config: GenerateConfig,
-    ) -> List[str]:
-        pass
-
-    def generate(self, messages: List[Dict[str, str]], config: GenerateConfig) -> str:
-        return self.generate_batch([messages], config)[0]
-
-    def close(self) -> None:
-        pass
-
-
 class TransformersLLM(LLM):
     def __init__(
         self,
-        model_path: str,
+        model_path: str | None = None,
         *,
         device: str = "auto",
+        model: Any | None = None,
+        tokenizer: Any | None = None,
     ) -> None:
-        self.model_path = model_path
+        if model is not None and tokenizer is not None:
+            self.model_path = model_path or ""
+            self._model = model
+            self._tokenizer = tokenizer
+            self._tokenizer.padding_side = "left"
+            return
 
+        if model_path is None:
+            raise ValueError("require model_path or model")
+
+        self.model_path = model_path
         self._tokenizer = AutoTokenizer.from_pretrained(model_path)
         self._tokenizer.padding_side = "left"
         self._model = AutoModelForCausalLM.from_pretrained(
@@ -57,25 +43,16 @@ class TransformersLLM(LLM):
         self,
         batch_messages: List[List[Dict[str, str]]],
         config: GenerateConfig,
-    ) -> List[str]:
-        input_texts = []
-        for messages in batch_messages:
-            input_text = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True,
-            )
-            input_texts.append(input_text)
-
-        model_inputs = self._tokenizer(
-            input_texts,
-            return_tensors="pt",
-            padding=True,
-        ).to(self._model.device)
-        prompt_len = int(model_inputs["input_ids"].shape[1])
-        out = self._model.generate(  # type: ignore
-            **model_inputs,
+    ) -> List[Generation]:
+        model_inputs = build_model_inputs(
+            self._tokenizer,
+            batch_messages,
+            add_generation_prompt=True,
+            device=self._model.device,
+        )
+        prompt_len = int(model_inputs["input_ids"].shape[1])  # type: ignore
+        out = self._model.generate(
+            **model_inputs,  # type: ignore
             max_new_tokens=config.max_new_tokens,
             temperature=config.temperature,
             do_sample=config.temperature > 0,
@@ -83,13 +60,20 @@ class TransformersLLM(LLM):
             top_k=config.top_k,
         )
 
-        output_texts = []
+        generations: List[Generation] = []
         for i in range(len(batch_messages)):
-            output_ids = out[i][prompt_len:].tolist()
-            output_texts.append(
-                self._tokenizer.decode(output_ids, skip_special_tokens=True)
+            output_ids_tensor = out[i][prompt_len:]
+            completion_tokens = int(
+                (output_ids_tensor != self._tokenizer.pad_token_id).sum().item()
             )
-        return output_texts
+            output_ids = output_ids_tensor[:completion_tokens].tolist()
+            generations.append(
+                Generation(
+                    text=self._tokenizer.decode(output_ids, skip_special_tokens=True),
+                    completion_tokens=completion_tokens,
+                )
+            )
+        return generations
 
 
 class OpenAILLM(LLM):
@@ -103,31 +87,35 @@ class OpenAILLM(LLM):
         self._client = OpenAI(base_url=base_url, api_key=api_key)
         self.model_name = model_name
 
-    def generate(self, messages: List[Dict[str, str]], config: GenerateConfig) -> str:
+    def generate(
+        self, messages: List[Dict[str, str]], config: GenerateConfig
+    ) -> Generation:
         resp = self._client.chat.completions.create(
             model=self.model_name,
-            messages=cast(Any, messages),
+            messages=messages,  # type: ignore
             max_tokens=config.max_new_tokens,
             temperature=config.temperature,
             top_p=config.top_p,
             extra_body={"top_k": config.top_k},
         )
-        return resp.choices[0].message.content or ""
+        text = resp.choices[0].message.content or ""
+        completion_tokens = 0
+        usage = getattr(resp, "usage", None)
+        if usage is not None and getattr(usage, "completion_tokens", None) is not None:
+            completion_tokens = int(usage.completion_tokens)
+        return Generation(text=text, completion_tokens=completion_tokens)
 
     def generate_batch(
         self,
         batch_messages: List[List[Dict[str, str]]],
         config: GenerateConfig,
-    ) -> List[str]:
+    ) -> List[Generation]:
         if not batch_messages:
             return []
 
         with ThreadPoolExecutor(max_workers=len(batch_messages)) as executor:
             return list(
-                executor.map(
-                    lambda messages: self.generate(messages, config),
-                    batch_messages,
-                )
+                executor.map(lambda m: self.generate(m, config), batch_messages)
             )
 
 
@@ -148,7 +136,7 @@ class VllmLLM(LLM):
         self,
         batch_messages: List[List[Dict[str, str]]],
         config: GenerateConfig,
-    ) -> List[str]:
+    ) -> List[Generation]:
         sampling_params = SamplingParams(
             temperature=config.temperature,
             max_tokens=config.max_new_tokens,
@@ -156,9 +144,19 @@ class VllmLLM(LLM):
             top_k=config.top_k,
         )
         outputs = self._llm.chat(
-            cast(Any, batch_messages),
+            batch_messages,  # type: ignore
             sampling_params=sampling_params,
             use_tqdm=False,
             add_generation_prompt=True,
         )
-        return [output.outputs[0].text for output in outputs]
+        generations: List[Generation] = []
+        for output in outputs:
+            text = output.outputs[0].text
+            completion_tokens = 0
+            token_ids = getattr(output.outputs[0], "token_ids", None)
+            if token_ids is not None:
+                completion_tokens = len(token_ids)
+            generations.append(
+                Generation(text=text, completion_tokens=completion_tokens)
+            )
+        return generations
