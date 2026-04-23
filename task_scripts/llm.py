@@ -1,12 +1,18 @@
+import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List
 
+import requests
 import torch
 from common import LLM, GenerateConfig, Generation, build_model_inputs
 from openai import OpenAI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from vllm import LLM as VLLMEngine
 from vllm import SamplingParams
+from vllm.distributed.weight_transfer.ipc_engine import (
+    IPCTrainerSendWeightsArgs,
+    IPCWeightTransferEngine,
+)
 
 
 class TransformersLLM(LLM):
@@ -125,11 +131,17 @@ class VllmLLM(LLM):
         model_path: str,
         *,
         gpu_memory_utilization: float = 0.85,
+        enforce_eager: bool = False,
+        max_model_len: int | None = None,
     ) -> None:
         self.model_path = model_path
+        self.enforce_eager = enforce_eager
+        self.max_model_len = max_model_len
         self._llm = VLLMEngine(
             model=model_path,
             gpu_memory_utilization=gpu_memory_utilization,
+            enforce_eager=enforce_eager,
+            max_model_len=max_model_len,
         )
 
     def generate_batch(
@@ -160,3 +172,64 @@ class VllmLLM(LLM):
                 Generation(text=text, completion_tokens=completion_tokens)
             )
         return generations
+
+
+class VllmHttpIPCLLM(OpenAILLM):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model_name: str,
+        sync_timeout: float = 60.0,
+    ) -> None:
+        self._control_base_url = base_url.rstrip("/")
+        self._sync_timeout = sync_timeout
+        self._weight_transfer_initialized = False
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+        super().__init__(
+            base_url=f"{self._control_base_url}/v1",
+            api_key=api_key,
+            model_name=model_name,
+        )
+
+    def _post(
+        self,
+        path: str,
+        *,
+        json_payload: Dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        response = requests.post(
+            f"{self._control_base_url}{path}",
+            json=json_payload,
+            timeout=timeout or self._sync_timeout,
+        )
+        response.raise_for_status()
+
+    def init_weight_transfer_engine(self) -> None:
+        if self._weight_transfer_initialized:
+            return
+        self._post("/init_weight_transfer_engine", json_payload={"init_info": dict()})
+        self._weight_transfer_initialized = True
+
+    def pause_generation(self) -> None:
+        self._post("/pause")
+
+    def resume_generation(self) -> None:
+        self._post("/resume")
+
+    def sync_from_actor(self, actor_model: Any) -> None:
+        self.init_weight_transfer_engine()
+        self.pause_generation()
+        try:
+            trainer_args = IPCTrainerSendWeightsArgs(
+                mode="http",
+                url=self._control_base_url,
+            )
+            IPCWeightTransferEngine.trainer_send_weights(
+                iterator=actor_model.named_parameters(),
+                trainer_args=trainer_args,
+            )
+        finally:
+            self.resume_generation()

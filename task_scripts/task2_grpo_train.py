@@ -7,6 +7,7 @@ from typing import Any, List
 import torch
 import torch.nn.functional as F
 from common import (
+    LLM,
     BenchmarkResult,
     EvalResult,
     GenerateConfig,
@@ -17,7 +18,7 @@ from common import (
     run_benchmark,
 )
 from dotenv import load_dotenv
-from llm import TransformersLLM
+from llm import TransformersLLM, VllmHttpIPCLLM, VllmLLM
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -30,15 +31,45 @@ def evaluate_checkpoint(
     actor_model: Any,
     tokenizer: Any,
     *,
+    eval_backend: str,
     val_data_path: str,
     eval_samples: int,
     eval_batch_size: int,
     eval_generate_config: GenerateConfig,
+    eval_llm: LLM | None = None,
+    rollout_base_url: str = "",
+    rollout_model_name: str = "",
+    rollout_api_key: str = "EMPTY",
 ) -> BenchmarkResult:
-    was_training = actor_model.training
-    actor_model.eval()
-    llm = TransformersLLM(model=actor_model, tokenizer=tokenizer)
-    try:
+    if eval_backend == "transformers":
+        was_training = actor_model.training
+        actor_model.eval()
+        llm = TransformersLLM(model=actor_model, tokenizer=tokenizer)
+        try:
+            return run_benchmark(
+                llm,
+                val_data_path,
+                max_samples=eval_samples,
+                batch_size=eval_batch_size,
+                generate_config=eval_generate_config,
+            )
+        finally:
+            if was_training:
+                actor_model.train()
+
+    if eval_backend == "vllm_http_ipc":
+        llm = eval_llm
+        if llm is None:
+            llm = VllmHttpIPCLLM(
+                base_url=rollout_base_url,
+                api_key=rollout_api_key,
+                model_name=rollout_model_name,
+            )
+        if not isinstance(llm, VllmHttpIPCLLM):
+            raise ValueError(
+                "eval_llm must be VllmHttpIPCLLM when eval_backend is vllm_http_ipc"
+            )
+        llm.sync_from_actor(actor_model)
         return run_benchmark(
             llm,
             val_data_path,
@@ -46,36 +77,8 @@ def evaluate_checkpoint(
             batch_size=eval_batch_size,
             generate_config=eval_generate_config,
         )
-    finally:
-        if was_training:
-            actor_model.train()
 
-
-def collect_group_rollouts(
-    actor_model: Any,
-    tokenizer: Any,
-    batch_samples: List[Sample],
-    *,
-    group_size: int,
-    rollout_generate_config: GenerateConfig,
-) -> List[List[EvalResult]]:
-    if not batch_samples:
-        return []
-
-    # 同一个sample连续group_size次
-    rollout_samples = [sample for sample in batch_samples for _ in range(group_size)]
-    llm = TransformersLLM(model=actor_model, tokenizer=tokenizer)
-    was_training = actor_model.training
-    actor_model.eval()
-    try:
-        results = eval_batch(llm, rollout_samples, rollout_generate_config)
-    finally:
-        if was_training:
-            actor_model.train()
-
-    return [
-        results[i : i + group_size] for i in range(0, len(rollout_samples), group_size)
-    ]
+    raise ValueError(f"unsupported eval_backend: {eval_backend}")
 
 
 @dataclass
@@ -237,10 +240,80 @@ def build_rollout_batch(
 
 def reward_fn(result: EvalResult) -> float:
     if result.ok:
-        return 1.0
+        return 1.0 + 0.2 * (1024 - result.output_len) / 1024
     if result.format_ok:
         return 0.2
     return 0.0
+
+
+def rollout(
+    rollout_llm: LLM | None,
+    *,
+    should_sync: bool,
+    rollout_backend: str,
+    actor_model: Any,
+    tokenizer: Any,
+    rollout_model_path: Path,
+    rollout_base_url: str,
+    rollout_model_name: str,
+    rollout_api_key: str,
+    vllm_gpu_memory_utilization: float,
+    vllm_enforce_eager: bool,
+    vllm_max_model_len: int | None,
+    batch_samples: List[Sample],
+    group_size: int,
+    rollout_generate_config: GenerateConfig,
+) -> tuple[LLM, List[List[EvalResult]]]:
+    if not batch_samples:
+        assert rollout_llm is not None
+        return rollout_llm, []
+
+    if should_sync:
+        if rollout_llm is not None and rollout_backend == "vllm":
+            rollout_llm.close()
+        if rollout_backend == "transformers":
+            rollout_llm = TransformersLLM(model=actor_model, tokenizer=tokenizer)
+        elif rollout_backend == "vllm":
+            actor_model.save_pretrained(rollout_model_path)
+            tokenizer.save_pretrained(rollout_model_path)
+            rollout_llm = VllmLLM(
+                str(rollout_model_path),
+                gpu_memory_utilization=vllm_gpu_memory_utilization,
+                enforce_eager=vllm_enforce_eager,
+                max_model_len=vllm_max_model_len,
+            )
+        elif rollout_backend == "vllm_http_ipc":
+            if rollout_llm is None:
+                rollout_llm = VllmHttpIPCLLM(
+                    base_url=rollout_base_url,
+                    api_key=rollout_api_key,
+                    model_name=rollout_model_name,
+                )
+            assert isinstance(rollout_llm, VllmHttpIPCLLM)
+            rollout_llm.sync_from_actor(actor_model)
+        else:
+            raise ValueError(f"unsupported rollout_backend: {rollout_backend}")
+
+    assert rollout_llm is not None
+    rollout_samples = [sample for sample in batch_samples for _ in range(group_size)]
+    if rollout_backend == "transformers":
+        was_training = actor_model.training
+        actor_model.eval()
+        try:
+            results = eval_batch(rollout_llm, rollout_samples, rollout_generate_config)
+        finally:
+            if was_training:
+                actor_model.train()
+    else:
+        results = eval_batch(rollout_llm, rollout_samples, rollout_generate_config)
+
+    return (
+        rollout_llm,
+        [
+            results[i : i + group_size]
+            for i in range(0, len(rollout_samples), group_size)
+        ],
+    )
 
 
 def train_grpo() -> None:
@@ -250,20 +323,29 @@ def train_grpo() -> None:
     然后按micro_batch_size分批次计算累积梯度到mini_batch_size更新参数
     按照mini_batch_size也就是参数更新来统计step
     """
+    rollout_backend = "vllm_http_ipc"
+    eval_backend = rollout_backend
+    rollout_sync_freq = 1
+    rollout_base_url = os.getenv("ROLLOUT_BASE_URL", "http://localhost:8006")
+    rollout_model_name = os.getenv("MODEL_NAME_0P6B", "Qwen3-0.6B")
+    rollout_api_key = os.getenv("ROLLOUT_API_KEY", "EMPTY")
+    vllm_gpu_memory_utilization = 0.3
+    vllm_enforce_eager = True
+    vllm_max_model_len = 8192
     shuffle_rollout = True
     prompt_batch_size = 8
-    group_size = 4
+    group_size = 8
     train_batch_size = prompt_batch_size * group_size
-    mini_batch_size = 16
-    micro_batch_size = 4
+    mini_batch_size = 32
+    micro_batch_size = 1
     train_samples = 1000
-    lr = 1e-6
+    lr = 5e-6
     epsilon = 0.2
-    beta = 0.01
+    beta = 0.001
     eval_every_train_steps = 10
     eval_samples = 100
-    eval_batch_size = 64
-    rollout_max_new_tokens = 1024
+    eval_batch_size = 128
+    rollout_max_new_tokens = 2048
     eval_max_new_tokens = 1024
 
     model_path = os.getenv("MODEL_PATH_0P6B", "")
@@ -272,6 +354,8 @@ def train_grpo() -> None:
     exp_name = f"grpo_gs{group_size}"
     ckpt_path = Path(f"data/ckpt/{exp_name}")
     ckpt_path.mkdir(parents=True, exist_ok=True)
+    rollout_model_path = ckpt_path / "rollout_model"
+    rollout_model_path.mkdir(parents=True, exist_ok=True)
 
     samples = load_samples(Path(train_data_path), max_samples=train_samples)
     assert train_batch_size % group_size == 0
@@ -299,6 +383,15 @@ def train_grpo() -> None:
             "model_path": model_path,
             "train_data_path": train_data_path,
             "ckpt_path": str(ckpt_path),
+            "rollout_backend": rollout_backend,
+            "eval_backend": eval_backend,
+            "rollout_sync_freq": rollout_sync_freq,
+            "rollout_model_path": str(rollout_model_path),
+            "rollout_base_url": rollout_base_url,
+            "rollout_model_name": rollout_model_name,
+            "vllm_gpu_memory_utilization": vllm_gpu_memory_utilization,
+            "vllm_enforce_eager": vllm_enforce_eager,
+            "vllm_max_model_len": vllm_max_model_len,
             "total_samples": len(samples),
             "shuffle_rollout": shuffle_rollout,
             "prompt_batch_size": prompt_batch_size,
@@ -321,8 +414,10 @@ def train_grpo() -> None:
     )
     optimizer.zero_grad()
     train_step = 0
+    rollout_count = 0
     seen_prompts = 0
     seen_samples = 0
+    rollout_llm: LLM | None = None
     rollout_generate_config = GenerateConfig(
         max_new_tokens=rollout_max_new_tokens,
     )
@@ -335,13 +430,28 @@ def train_grpo() -> None:
         seen_prompts += prompt_count
 
         rollout_start_time = time.perf_counter()
-        rollout_groups = collect_group_rollouts(
-            actor_model,
-            tokenizer,
-            prompt_batch,
+        should_sync_rollout = rollout_llm is None or (
+            rollout_backend in {"vllm", "vllm_http_ipc"}
+            and rollout_count % rollout_sync_freq == 0
+        )
+        rollout_llm, rollout_groups = rollout(
+            rollout_llm,
+            should_sync=should_sync_rollout,
+            rollout_backend=rollout_backend,
+            actor_model=actor_model,
+            tokenizer=tokenizer,
+            rollout_model_path=rollout_model_path,
+            rollout_base_url=rollout_base_url,
+            rollout_model_name=rollout_model_name,
+            rollout_api_key=rollout_api_key,
+            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+            vllm_enforce_eager=vllm_enforce_eager,
+            vllm_max_model_len=vllm_max_model_len,
+            batch_samples=prompt_batch,
             group_size=group_size,
             rollout_generate_config=rollout_generate_config,
         )
+        rollout_count += 1
         rollout_time = time.perf_counter() - rollout_start_time
         # 平铺开 每个组的在一起
         flat_rollout_results = [result for group in rollout_groups for result in group]
@@ -492,10 +602,15 @@ def train_grpo() -> None:
                 benchmark_result = evaluate_checkpoint(
                     actor_model,
                     tokenizer,
+                    eval_backend=eval_backend,
                     val_data_path=val_data_path,
                     eval_samples=eval_samples,
                     eval_batch_size=eval_batch_size,
                     eval_generate_config=eval_generate_config,
+                    eval_llm=rollout_llm,
+                    rollout_base_url=rollout_base_url,
+                    rollout_model_name=rollout_model_name,
+                    rollout_api_key=rollout_api_key,
                 )
                 eval_accuracy = (
                     benchmark_result.correct / benchmark_result.total
@@ -528,6 +643,8 @@ def train_grpo() -> None:
 
     actor_model.save_pretrained(ckpt_path)
     tokenizer.save_pretrained(ckpt_path)
+    if rollout_llm is not None:
+        rollout_llm.close()
     wandb_run.config.update({"saved_checkpoint": str(ckpt_path)})
     wandb.finish()
     progress.close()
