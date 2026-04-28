@@ -8,5 +8,5 @@ python -m vllm.entrypoints.openai.api_server \
   --tool-call-parser hermes \
   --host 0.0.0.0 \
   --port 8080 \
-  --max-model-len 8192 \
+  --max-model-len 16384 \
   --gpu-memory-utilization 0.85

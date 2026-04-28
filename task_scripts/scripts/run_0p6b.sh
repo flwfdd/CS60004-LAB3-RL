@@ -1,5 +1,5 @@
 MODEL_PATH="/mlx/users/fanliwen.2333/playground/models/Qwen3-0.6B"
-# MODEL_PATH="/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/ckpt/dpo_0p6b_vs_0p6b_1000_bs16_nll"
+MODEL_PATH="/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs16_gs8_test_basedpoep10/best"
 MODEL_NAME="Qwen3-0.6B"
 
 python -m vllm.entrypoints.openai.api_server \

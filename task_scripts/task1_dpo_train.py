@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List
@@ -14,6 +15,7 @@ from common import (
     Sample,
     build_training_inputs,
     eval_batch,
+    extract_output_text,
     load_samples,
     run_benchmark,
 )
@@ -59,10 +61,11 @@ def evaluate_checkpoint(
 
 
 def build_preference_pairs(
+    samples: list[Sample],
     llm1: LLM,
     llm2: LLM,
-    samples: list[Sample],
-    generate_config: GenerateConfig,
+    generate_config1: GenerateConfig,
+    generate_config2: GenerateConfig,
     batch_size: int = 8,
 ) -> list[DPOSample]:
     """对同一批样本用两个 LLM 各推理一次，一对一错时构成偏好对"""
@@ -70,27 +73,17 @@ def build_preference_pairs(
     pairs: list[DPOSample] = []
     for i in tqdm(range(0, len(samples), batch_size)):
         batch = samples[i : i + batch_size]
-        results1 = eval_batch(llm1, batch, generate_config)
-        results2 = eval_batch(llm2, batch, generate_config)
+        results1 = eval_batch(llm1, batch, generate_config1)
+        results2 = eval_batch(llm2, batch, generate_config2)
         for result1, result2 in zip(results1, results2):
-            if (result1.ok and not result2.ok) or (
-                result1.ok and result2.ok and (result1.output_len < result2.output_len)
-            ):
+            if result1.ok and not result2.ok:
                 pairs.append(
                     DPOSample(
                         chosen_messages=result1.messages,
                         rejected_messages=result2.messages,
                     )
                 )
-            elif (
-                not result1.ok
-                and result2.ok
-                or (
-                    result1.ok
-                    and result2.ok
-                    and (result1.output_len > result2.output_len)
-                )
-            ):
+            elif not result1.ok and result2.ok:
                 pairs.append(
                     DPOSample(
                         chosen_messages=result2.messages,
@@ -98,6 +91,68 @@ def build_preference_pairs(
                     )
                 )
     print(f"Generated {len(pairs)} preference pairs out of {len(samples)}")
+    return pairs
+
+
+def build_rejection_samples(
+    llm: LLM,
+    samples: list[Sample],
+    generate_config: GenerateConfig,
+    try_num: int = 1,
+    batch_size: int = 8,
+    acc_threshold: float = 1.0,
+) -> list[DPOSample]:
+    """对每条样本采样 try_num 次，正确率低于阈值时取 最短正确 vs 最短错误 构成偏好对。"""
+    sample_batch_size = max(1, batch_size // try_num)
+    pairs: list[DPOSample] = []
+    total_trials = 0
+    total_correct = 0
+    skipped_no_pair = 0
+
+    for i in tqdm(range(0, len(samples), sample_batch_size), desc="Rejection Sampling"):
+        batch = samples[i : i + sample_batch_size]
+
+        # 每条样本重复 try_num 次
+        repeated_samples: list[Sample] = []
+        for s in batch:
+            repeated_samples.extend([s] * try_num)
+
+        results = eval_batch(llm, repeated_samples, generate_config)
+        for j, s in enumerate(batch):
+            group = results[j * try_num : (j + 1) * try_num]
+            total_trials += try_num
+            num_correct = sum(int(r.ok) for r in group)
+            total_correct += num_correct
+
+            # 只对正确率低于阈值的样本构造偏好对
+            print(f"id={i+j} acc={num_correct / try_num:.4f}({num_correct}/{try_num})")
+            if (num_correct / try_num) >= acc_threshold:
+                continue
+
+            correct = [r for r in group if r.ok]
+            wrong = [r for r in group if not r.ok]
+
+            if not correct or not wrong:
+                skipped_no_pair += 1
+                continue
+
+            # chosen: 正确里长度最短
+            chosen = min(correct, key=lambda r: r.output_len)
+            # rejected: 错误里长度最短
+            rejected = min(wrong, key=lambda r: r.output_len)
+
+            pairs.append(
+                DPOSample(
+                    chosen_messages=chosen.messages,
+                    rejected_messages=rejected.messages,
+                )
+            )
+
+    overall_acc = total_correct / total_trials if total_trials else 0.0
+    print(
+        f"[rejection_sampling] trials={total_trials} overall_accuracy={overall_acc:.4f} "
+        f"pairs={len(pairs)} skipped_no_pair={skipped_no_pair}"
+    )
     return pairs
 
 
@@ -122,51 +177,163 @@ def read_pairs(path: Path) -> list[DPOSample]:
         return pairs
 
 
+def _extract_tag_content(text: str, tag: str) -> str | None:
+    m = re.findall(
+        rf"<{tag}>\s*(.*?)\s*</{tag}>", text, flags=re.DOTALL | re.IGNORECASE
+    )
+    return m[-1].strip() if m else None
+
+
+def rewrite_think_batch(
+    texts: list[str],
+    llm: LLM,
+    generate_config: GenerateConfig,
+    batch_size: int = 8,
+) -> list[str]:
+    """只重写 <think>，保留 <answer> 不变；重写失败的样本返回空字符串。"""
+    if not texts:
+        return []
+
+    prompts: list[list[dict[str, str]]] = []
+    meta: list[tuple[int, str]] = []  # (index, answer)
+    out = ["" for _ in texts]
+
+    for idx, t in enumerate(texts):
+        answer = _extract_tag_content(t, "answer")
+        if answer is None:
+            continue
+
+        prompt = f"""Rewrite this math reasoning more concisely.
+
+Rules:
+- Keep ALL steps and reasoning logic (including failed attempts) in the original order
+- Remove ALL filler
+- Keep full arithmetic calculations
+- Do not output final answer at beginning
+
+Original reasoning: {t.replace("<think>", "").replace("</think>", "")}
+
+Plan how to rewrite in <think> and output the full compact reasoning process."""
+        prompts.append(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ]
+        )
+        meta.append((idx, answer))
+
+    # 按 batch_size 分块请求，避免一次性发太多并发/请求体过大
+    gens = []
+    for start in tqdm(
+        range(0, len(prompts), batch_size),
+        desc="Rewrite Think",
+    ):
+        gens.extend(
+            llm.generate_batch(prompts[start : start + batch_size], generate_config)
+        )
+
+    for gen, (idx, answer) in zip(gens, meta):
+        rewrite_think = extract_output_text(gen.text)
+        if rewrite_think:
+            out[idx] = (
+                f"<think>\n{rewrite_think}\n</think>\n<answer> {answer} </answer>"
+            )
+
+    return out
+
+
 def generate_pairs_pipeline() -> None:
     # 模型规模: 0p6b / 8b
-    model_size = "0p6b"
+    model_size1 = "0p6b"
+    model_size2 = "8b"
+
+    # preference: 两次采样构 pair；rejection: 多次采样，低于阈值才构 pair
+    pair_mode: str = "rejection"
 
     # 从 .env 读取模型配置
-    model_name = os.getenv(f"MODEL_NAME_{model_size.upper()}", "")
-    base_url = os.getenv(f"BASE_URL_{model_size.upper()}", "")
+    model_name1 = os.getenv(f"MODEL_NAME_{model_size1.upper()}", "")
+    base_url1 = os.getenv(f"BASE_URL_{model_size1.upper()}", "")
+    model_name2 = os.getenv(f"MODEL_NAME_{model_size2.upper()}", "")
+    base_url2 = os.getenv(f"BASE_URL_{model_size2.upper()}", "")
+
     api_key = os.getenv("API_KEY", "EMPTY")
 
     # 数据路径
-    train_data_path = os.getenv("TRAIN_DATA_PATH", "")
+    # train_data_path = os.getenv("TRAIN_DATA_PATH", "")
+    train_data_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
 
     # 评测规模与生成配置
-    max_samples = 10000
-    batch_size = 1024
-    max_new_tokens = 1024
+    max_samples = 1024
+    batch_size = 512
+    try_num = 128
+    acc_threshold = 0.9
 
     # 输出路径
-    output_path = Path("data/dpo/0p6b_vs_0p6b_shorter.jsonl")
+    output_path = Path("data/dpo/0p6b_test_rejection.jsonl")
+    rewritten_output_path = Path("data/dpo/0p6b_test_rewritten.jsonl")
 
-    # 同一个模型采样两次（不同温度）来构造偏好对
-    llm1 = OpenAILLM(
-        base_url=base_url,
-        api_key=api_key,
-        model_name=model_name,
+    generate_config1 = GenerateConfig(
+        max_new_tokens=1024,
+        temperature=0.6,
     )
-    llm2 = OpenAILLM(
-        base_url=base_url,
-        api_key=api_key,
-        model_name=model_name,
+    generate_config2 = GenerateConfig(
+        max_new_tokens=4096,
+        temperature=0.6,
     )
 
-    generate_config = GenerateConfig(
-        max_new_tokens=max_new_tokens,
-    )
-
-    try:
-        samples = load_samples(Path(train_data_path), max_samples=max_samples)
-        pairs = build_preference_pairs(
-            llm1, llm2, samples, generate_config, batch_size=batch_size
-        )
-        save_pairs(pairs, output_path)
-    finally:
-        llm1.close()
-        llm2.close()
+    llm1 = OpenAILLM(base_url=base_url1, api_key=api_key, model_name=model_name1)
+    llm2 = OpenAILLM(base_url=base_url2, api_key=api_key, model_name=model_name2)
+    samples = load_samples(Path(train_data_path), max_samples=max_samples)
+    if pair_mode == "rejection":
+        try:
+            pairs = build_rejection_samples(
+                llm1,
+                samples,
+                generate_config1,
+                try_num=try_num,
+                batch_size=batch_size,
+                acc_threshold=acc_threshold,
+            )
+            save_pairs(pairs, output_path)
+        finally:
+            llm1.close()
+    elif pair_mode == "preference":
+        # 同一个模型采样两次来构造偏好对
+        try:
+            pairs = build_preference_pairs(
+                samples,
+                llm1,
+                llm2,
+                generate_config1,
+                generate_config2,
+                batch_size=batch_size,
+            )
+            save_pairs(pairs, output_path)
+            # pairs = read_pairs(output_path)
+            # 重写为精简版
+            if pairs:
+                rewritten_chosen_texts = rewrite_think_batch(
+                    [pair.chosen_messages[-1].get("content", "") for pair in pairs],
+                    llm2,
+                    generate_config2,
+                    batch_size=batch_size,
+                )
+                rewritten_pairs: list[DPOSample] = []
+                for pair, rewritten_text in zip(pairs, rewritten_chosen_texts):
+                    chosen_messages = [dict(m) for m in pair.chosen_messages]
+                    if not rewritten_text:
+                        continue
+                    chosen_messages[-1]["content"] = rewritten_text
+                    rewritten_pairs.append(
+                        DPOSample(
+                            chosen_messages=chosen_messages,
+                            rejected_messages=pair.rejected_messages,
+                        )
+                    )
+                save_pairs(rewritten_pairs, rewritten_output_path)
+        finally:
+            llm1.close()
+            llm2.close()
 
 
 def compute_logps(
@@ -207,20 +374,22 @@ def dpo_loss(
 
 def train_dpo() -> None:
     # 训练配置
-    micro_batch_size = 2
+    micro_batch_size = 1
     train_batch_size = 16
-    train_samples = 1000
+    train_samples = 20480
     lr = 1e-6
-    alpha = 1.0
-    beta = 0.1
-    eval_every_train_steps = 10
-    eval_samples = 100
-    eval_batch_size = 64
+    alpha = 0.999  # nll 权重
+    beta = 0.1  # dpo 公式内
+    eval_every_train_steps = 10000
+    eval_samples = 0
+    eval_batch_size = 32
     eval_max_new_tokens = 1024
-    model_path = os.getenv(f"MODEL_PATH_0P6B", "")
-    pairs_path = Path("data/dpo/0p6b_vs_0p6b.jsonl")
+    # model_path = os.getenv(f"MODEL_PATH_0P6B", "")
+    model_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs64_gs8_test/best"
+    pairs_path = Path("data/dpo/0p6b_test_rejection_repeat10.jsonl")
     val_data_path = os.getenv("VAL_DATA_PATH", "")
-    exp_name = "dpo_0p6b_vs_0p6b_1000_bs16_nll"
+    val_data_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
+    exp_name = "dpo_0p6b_test_rejection_0p999nll_ep10"
     ckpt_path = Path(f"data/ckpt/{exp_name}")
     ckpt_path.mkdir(parents=True, exist_ok=True)
     pairs = read_pairs(pairs_path)[:train_samples]
@@ -338,7 +507,7 @@ def train_dpo() -> None:
             beta=beta,
         )
         loss_nll = -(actor_chosen_logps / chosen_token_count).mean()
-        loss = alpha * loss_nll + loss_dpo
+        loss = alpha * loss_nll + (1 - alpha) * loss_dpo
 
         scaled_loss = loss * (batch_samples / train_batch_size)
         scaled_loss.backward()
@@ -414,31 +583,24 @@ def train_dpo() -> None:
                     eval_batch_size=eval_batch_size,
                     eval_generate_config=eval_generate_config,
                 )
-                eval_accuracy = (
-                    benchmark_result.correct / benchmark_result.total
-                    if benchmark_result.total
-                    else 0.0
-                )
+                summary = benchmark_result.summary
+                eval_accuracy = summary.accuracy
                 log_data.update(
                     {
-                        "eval/total": benchmark_result.total,
-                        "eval/correct": benchmark_result.correct,
+                        "eval/total": summary.total,
+                        "eval/correct": summary.correct,
                         "eval/accuracy": eval_accuracy,
-                        "eval/format_correct": benchmark_result.format_correct,
-                        "eval/format_accuracy": (
-                            benchmark_result.format_correct / benchmark_result.total
-                            if benchmark_result.total
-                            else 0.0
-                        ),
-                        "eval/avg_output_len": benchmark_result.avg_output_len,
-                        "eval/avg_output_len_correct": benchmark_result.avg_output_len_correct,
-                        "eval/avg_output_len_format_ok_wrong": benchmark_result.avg_output_len_format_ok_wrong,
-                        "eval/avg_output_len_format_wrong": benchmark_result.avg_output_len_format_wrong,
+                        "eval/format_correct": summary.format_correct,
+                        "eval/format_accuracy": summary.format_accuracy,
+                        "eval/avg_output_len": summary.avg_output_len,
+                        "eval/avg_output_len_correct": summary.avg_output_len_correct,
+                        "eval/avg_output_len_format_ok_wrong": summary.avg_output_len_format_ok_wrong,
+                        "eval/avg_output_len_format_wrong": summary.avg_output_len_format_wrong,
                     }
                 )
                 print(
                     f"[benchmark] train_step={train_step}/{total_train_steps} "
-                    f"eval_samples={benchmark_result.total} "
+                    f"eval_samples={summary.total} "
                     f"accuracy={eval_accuracy:.4f} "
                 )
             wandb.log(log_data, step=seen_samples)
@@ -465,5 +627,5 @@ def train_dpo() -> None:
 
 
 if __name__ == "__main__":
-    # generate_pairs_pipeline()
-    train_dpo()
+    generate_pairs_pipeline()
+    # train_dpo()

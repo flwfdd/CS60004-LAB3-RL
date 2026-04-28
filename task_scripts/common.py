@@ -1,7 +1,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -52,6 +52,7 @@ class LLM(ABC):
 class Sample:
     nums: List[int]
     target: int
+    id: Any | None = None
 
 
 @dataclass
@@ -65,15 +66,23 @@ class EvalResult:
 
 
 @dataclass
-class BenchmarkResult:
+class BenchmarkStats:
     total: int
     correct: int
     format_correct: int
+    accuracy: float
+    format_accuracy: float
     avg_output_len: float
     avg_output_len_correct: float
     avg_output_len_format_ok_wrong: float
     avg_output_len_format_wrong: float
+
+
+@dataclass
+class BenchmarkResult:
+    summary: BenchmarkStats
     details: List[EvalResult]
+    by_num_count: Dict[int, BenchmarkStats]
 
 
 def build_messages(sample: Sample) -> List[Dict[str, str]]:
@@ -172,14 +181,20 @@ def iter_jsonl(path: Path) -> Iterable[Dict]:
             yield json.loads(line)
 
 
-def extract_answer_text(model_text: str) -> Optional[str]:
-    # 截取最后一个</think>后的内容作为输出 再从中提取
+def extract_output_text(model_text: str) -> Optional[str]:
+    # 截取最后一个</think>后的内容作为输出
     think_end_pos = model_text.rfind("</think>")
     if think_end_pos == -1:
         return None
-    model_text = model_text[think_end_pos + len("</think>") :].strip()
+    return model_text[think_end_pos + len("</think>") :].strip()
+
+
+def extract_answer_text(model_text: str) -> Optional[str]:
+    output_text = extract_output_text(model_text)
+    if output_text is None:
+        return None
     matches = re.findall(
-        r"<answer>\s*(.*?)\s*</answer>", model_text, flags=re.DOTALL | re.IGNORECASE
+        r"<answer>\s*(.*?)\s*</answer>", output_text, flags=re.DOTALL | re.IGNORECASE
     )
     return matches[-1].strip() if matches else None
 
@@ -201,10 +216,7 @@ def check_uses_numbers_once(text: str, nums: List[int]) -> bool:
     used = [int(x) for x in found]
     cnt_used = Counter(used)
     cnt_nums = Counter(nums)
-    for k, v in cnt_used.items():
-        if cnt_nums.get(k, 0) != v:
-            return False
-    return True
+    return cnt_used == cnt_nums
 
 
 def eval_batch(
@@ -237,43 +249,13 @@ def load_samples(path: Path, max_samples: Optional[int] = None) -> List[Sample]:
     for item in iter_jsonl(path):
         nums = [int(x) for x in item["nums"]]
         target = int(item["target"])
-        samples.append(Sample(nums=nums, target=target))
+        samples.append(Sample(nums=nums, target=target, id=item.get("id")))
         if max_samples is not None and len(samples) >= max_samples:
             break
     return samples
 
 
-def run_benchmark(
-    llm: LLM,
-    data_path: str,
-    *,
-    max_samples: Optional[int] = None,
-    batch_size: int = 1,
-    generate_config: Optional[GenerateConfig] = None,
-) -> BenchmarkResult:
-    samples = load_samples(Path(data_path), max_samples=max_samples)
-    if not samples:
-        return BenchmarkResult(
-            total=0,
-            correct=0,
-            format_correct=0,
-            avg_output_len=0.0,
-            avg_output_len_correct=0.0,
-            avg_output_len_format_ok_wrong=0.0,
-            avg_output_len_format_wrong=0.0,
-            details=[],
-        )
-    if generate_config is None:
-        generate_config = GenerateConfig()
-
-    batches = [samples[i : i + batch_size] for i in range(0, len(samples), batch_size)]
-    results: List[EvalResult] = []
-    progress = tqdm(total=len(samples), desc="Evaluating")
-    for batch_samples in batches:
-        results.extend(eval_batch(llm, batch_samples, generate_config))
-        progress.update(len(batch_samples))
-    progress.close()
-
+def summarize_eval_results(results: List[EvalResult]) -> BenchmarkStats:
     total = len(results)
     correct = sum(int(result.ok) for result in results)
     format_correct = sum(int(result.format_ok) for result in results)
@@ -289,13 +271,69 @@ def run_benchmark(
     def _avg(xs: List[int]) -> float:
         return float(sum(xs) / len(xs)) if xs else 0.0
 
-    return BenchmarkResult(
+    return BenchmarkStats(
         total=total,
         correct=correct,
         format_correct=format_correct,
+        accuracy=(correct / total) if total else 0.0,
+        format_accuracy=(format_correct / total) if total else 0.0,
         avg_output_len=_avg(output_lens),
         avg_output_len_correct=_avg(correct_output_lens),
         avg_output_len_format_ok_wrong=_avg(format_ok_wrong_output_lens),
         avg_output_len_format_wrong=_avg(format_wrong_output_lens),
+    )
+
+
+def summarize_eval_results_by_num_count(
+    results: List[EvalResult],
+) -> Dict[int, BenchmarkStats]:
+    buckets: Dict[int, List[EvalResult]] = defaultdict(list)
+    for result in results:
+        buckets[len(result.sample.nums)].append(result)
+    return {
+        num_count: summarize_eval_results(items)
+        for num_count, items in sorted(buckets.items(), key=lambda kv: kv[0])
+    }
+
+
+def run_benchmark(
+    llm: LLM,
+    data_path: str,
+    *,
+    max_samples: Optional[int] = None,
+    batch_size: int = 1,
+    generate_config: Optional[GenerateConfig] = None,
+) -> BenchmarkResult:
+    samples = load_samples(Path(data_path), max_samples=max_samples)
+    if not samples:
+        return BenchmarkResult(
+            summary=BenchmarkStats(
+                total=0,
+                correct=0,
+                format_correct=0,
+                accuracy=0.0,
+                format_accuracy=0.0,
+                avg_output_len=0.0,
+                avg_output_len_correct=0.0,
+                avg_output_len_format_ok_wrong=0.0,
+                avg_output_len_format_wrong=0.0,
+            ),
+            details=[],
+            by_num_count={},
+        )
+    if generate_config is None:
+        generate_config = GenerateConfig()
+
+    batches = [samples[i : i + batch_size] for i in range(0, len(samples), batch_size)]
+    results: List[EvalResult] = []
+    progress = tqdm(total=len(samples), desc="Evaluating")
+    for batch_samples in batches:
+        results.extend(eval_batch(llm, batch_samples, generate_config))
+        progress.update(len(batch_samples))
+    progress.close()
+
+    return BenchmarkResult(
+        summary=summarize_eval_results(results),
         details=results,
+        by_num_count=summarize_eval_results_by_num_count(results),
     )
