@@ -247,7 +247,7 @@ def generate_pairs_pipeline() -> None:
     model_size1 = "0p6b"
     model_size2 = "8b"
 
-    # preference: 两次采样构 pair；rejection: 多次采样，低于阈值才构 pair
+    # preference: 两次采样；rejection: 多次采样，筛选正确率低于阈值的
     pair_mode: str = "rejection"
 
     # 从 .env 读取模型配置
@@ -258,17 +258,14 @@ def generate_pairs_pipeline() -> None:
 
     api_key = os.getenv("API_KEY", "EMPTY")
 
-    # 数据路径
     # train_data_path = os.getenv("TRAIN_DATA_PATH", "")
-    train_data_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
+    train_data_path = "/root/autodl-tmp/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
 
-    # 评测规模与生成配置
     max_samples = 1024
     batch_size = 512
     try_num = 128
     acc_threshold = 0.9
 
-    # 输出路径
     output_path = Path("data/dpo/0p6b_test_rejection.jsonl")
     rewritten_output_path = Path("data/dpo/0p6b_test_rewritten.jsonl")
 
@@ -385,10 +382,10 @@ def train_dpo() -> None:
     eval_batch_size = 32
     eval_max_new_tokens = 1024
     # model_path = os.getenv(f"MODEL_PATH_0P6B", "")
-    model_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs64_gs8_test/best"
+    model_path = "/root/autodl-tmp/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs64_gs8_test/best"
     pairs_path = Path("data/dpo/0p6b_test_rejection_repeat10.jsonl")
     val_data_path = os.getenv("VAL_DATA_PATH", "")
-    val_data_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
+    val_data_path = "/root/autodl-tmp/code/CS60004-LAB3-RL/data/splits/raw_test.jsonl"
     exp_name = "dpo_0p6b_test_rejection_0p999nll_ep10"
     ckpt_path = Path(f"data/ckpt/{exp_name}")
     ckpt_path.mkdir(parents=True, exist_ok=True)

@@ -6,12 +6,8 @@ from typing import Iterable, List
 
 import pandas as pd
 
-INPUT_PATH = Path(
-    "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/raw_train.parquet"
-)
-OUTPUT_DIR = Path(
-    "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/splits"
-)
+INPUT_PATH = Path("/root/autodl-tmp/code/CS60004-LAB3-RL/data/raw_train.parquet")
+OUTPUT_DIR = Path("/root/autodl-tmp/code/CS60004-LAB3-RL/data/splits")
 
 SAMPLE_COUNT = 10000
 

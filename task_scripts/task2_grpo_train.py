@@ -250,9 +250,7 @@ class ReadyRollout:
 
 class RolloutManager:
     """
-    一个“单槽”rollout 管理器：把异步、同步频率、以及 eval 的安全点统一封装起来。
-
-    状态机只有 3 个状态：
+    状态机：
     - idle:   没有在跑的任务，也没有缓存结果
     - running:后台线程正在生成 rollout
     - ready:  rollout 已完成，但结果尚未被 flush 消费
@@ -453,7 +451,6 @@ class RolloutManager:
         self._wait_running_to_ready()
 
         if eval_backend == "transformers":
-            # 和你原来的逻辑保持一致：评测期间切 eval，结束后恢复 train
             was_training = actor_model.training
             actor_model.eval()
             llm = TransformersLLM(model=actor_model, tokenizer=tokenizer)
@@ -470,12 +467,27 @@ class RolloutManager:
                     actor_model.train()
 
         if eval_backend == "vllm_http_ipc":
-            # 复用同一个 HTTP vLLM server；上面已经 sync 过权重
+            # 复用同一个 HTTP vLLM server 上面已经 sync 过权重
             self.sync(actor_model)
             assert (
                 self._rollout_llm is not None
             ), "eval_backend=vllm_http_ipc requires backend initialization"
             assert isinstance(self._rollout_llm, VllmHttpIPCLLM)
+            return run_benchmark(
+                self._rollout_llm,
+                val_data_path,
+                max_samples=eval_samples,
+                batch_size=eval_batch_size,
+                generate_config=eval_generate_config,
+            )
+
+        if eval_backend == "vllm":
+            # 本地 vLLM 直接复用 sync() 创建出来的 VllmLLM
+            self.sync(actor_model)
+            assert (
+                self._rollout_llm is not None
+            ), "eval_backend=vllm requires initialization"
+            assert isinstance(self._rollout_llm, VllmLLM)
             return run_benchmark(
                 self._rollout_llm,
                 val_data_path,
@@ -533,7 +545,7 @@ def train_grpo() -> None:
     eval_max_new_tokens = 1024
 
     model_path = os.getenv("MODEL_PATH_0P6B", "")
-    model_path = "/mlx/users/fanliwen.2333/playground/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs16_gs8_test_basedpoep10/best"
+    model_path = "/root/autodl-tmp/code/CS60004-LAB3-RL/data/ckpt/grpo_trainbs64_minibs16_gs8_test_basedpoep10/best"
     train_data_path = os.getenv("TRAIN_DATA_PATH", "")
     train_data_path = "data/splits/raw_test_low_repeat_accuracy_v2_repeat.jsonl"
     val_data_path = os.getenv("VAL_DATA_PATH", "")
@@ -862,7 +874,7 @@ def train_grpo() -> None:
                         "eval/avg_output_len_format_wrong": summary.avg_output_len_format_wrong,
                     }
                 )
-                # 只有评测精度创新高时才额外保存一份 best ckpt，不影响最终 ckpt 正常落盘。
+                # 创新高时额外保存一份 best ckpt
                 if eval_accuracy > best_eval_accuracy:
                     best_eval_accuracy = eval_accuracy
                     best_eval_step = train_step

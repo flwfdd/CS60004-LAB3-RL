@@ -1,4 +1,4 @@
-MODEL_PATH="/mlx/users/fanliwen.2333/playground/models/Qwen3-0.6B"
+MODEL_PATH="/root/autodl-tmp/models/Qwen3-0.6B"
 MODEL_NAME="Qwen3-0.6B"
 PORT=8006
 MAX_MODEL_LEN=8192
